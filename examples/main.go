@@ -10,6 +10,7 @@ import (
 	"github.com/oarkflow/transaction"
 	"github.com/oarkflow/transaction/logs"
 	"github.com/oarkflow/transaction/metrics"
+	"github.com/oarkflow/transaction/storage"
 )
 
 type DummyResource struct {
@@ -436,6 +437,14 @@ func transactionBuilder() {
 }
 
 func main() {
+	// initialize storage and run recovery on startup
+	fstore, err := storage.NewFileStorage("./txlogs")
+	if err != nil {
+		log.Printf("failed to initialize storage: %v", err)
+	} else {
+		// run conservative recovery; log but don't fail startup
+		_ = transaction.RecoverInProgress(fstore, nil)
+	}
 	exampleBasicTransaction()
 	time.Sleep(500 * time.Millisecond)
 

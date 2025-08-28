@@ -14,6 +14,7 @@ import (
 
 	"github.com/oarkflow/transaction/logs"
 	"github.com/oarkflow/transaction/metrics"
+	"github.com/oarkflow/transaction/storage"
 )
 
 type contextKey string
@@ -69,16 +70,28 @@ type TwoPhaseCoordinator struct{}
 
 func (c *TwoPhaseCoordinator) BeginDistributed(tx *Transaction) error {
 	log.Printf("TwoPhaseCoordinator: Begin distributed transaction %d", tx.GetID())
+	// mark distributed begin in storage if available
+	if tx.storage != nil {
+		_ = tx.storage.AppendLog(tx.id, storage.LogEntry{Key: fmt.Sprintf("begin-%d", tx.id), Type: "begin", Applied: true})
+		_ = tx.storage.SaveTxState(tx.id, storage.TxStateInProgress, nil)
+	}
 	return nil
 }
 
 func (c *TwoPhaseCoordinator) CommitDistributed(tx *Transaction) error {
 	log.Printf("TwoPhaseCoordinator: Commit distributed transaction %d", tx.GetID())
+	// perform distributed prepare across participants (resources that are preparable)
+	if tx.storage != nil {
+		_ = tx.storage.SaveTxState(tx.id, storage.TxStateCommitting, nil)
+	}
 	return nil
 }
 
 func (c *TwoPhaseCoordinator) RollbackDistributed(tx *Transaction) error {
 	log.Printf("TwoPhaseCoordinator: Rollback distributed transaction %d", tx.GetID())
+	if tx.storage != nil {
+		_ = tx.storage.SaveTxState(tx.id, storage.TxStateRolledBack, nil)
+	}
 	return nil
 }
 
@@ -112,6 +125,7 @@ type TransactionOptions struct {
 	CaptureStackTrace      bool
 	Tracer                 metrics.Tracer
 	AuditLogger            logs.AuditLogger
+	Storage                storage.Storage
 }
 
 type TxState int
@@ -182,12 +196,20 @@ type Transaction struct {
 	captureStackTrace         bool
 	tracer                    metrics.Tracer
 	auditLogger               logs.AuditLogger
+	storage                   storage.Storage
 }
 
 var txCounter int64
 
 var txPool = sync.Pool{
 	New: func() any { return &Transaction{} },
+}
+
+var ErrAlreadyApplied = errors.New("already applied")
+
+// helper to create idempotency key for actions
+func idKey(txID int64, action string, index int) string {
+	return fmt.Sprintf("tx-%d-%s-%d", txID, action, index)
 }
 
 func LoadTransactionConfig() TransactionOptions {
@@ -334,13 +356,34 @@ func NewTransactionWithOptions(opts TransactionOptions) *Transaction {
 	tx.parallelCommit = opts.ParallelCommit
 	tx.parallelRollback = opts.ParallelRollback
 	tx.logger = opts.Logger
+	// ensure logger is always non-nil
+	if tx.logger == nil {
+		tx.logger = &logs.DefaultLogger{Fields: make(map[string]any), Level: logs.InfoLevel}
+	}
 	tx.metrics = opts.Metrics
+	if tx.metrics == nil {
+		tx.metrics = &metrics.NoopMetricsCollector{}
+	}
 	tx.lifecycleHooks = opts.LifecycleHooks
 	tx.distributedCoordinator = opts.DistributedCoordinator
 	tx.captureStackTrace = opts.CaptureStackTrace
 	tx.tracer = opts.Tracer
+	if tx.tracer == nil {
+		tx.tracer = &metrics.NoopTracer{}
+	}
+	tx.auditLogger = opts.AuditLogger
+	if tx.auditLogger == nil {
+		tx.auditLogger = &logs.SimpleAuditLogger{}
+	}
+	tx.storage = opts.Storage
+	// if storage present, persist initial state
+	if tx.storage != nil {
+		_ = tx.storage.SaveTxState(tx.id, storage.TxStateInitialized, map[string]any{"isolation": tx.isolationLevel})
+	}
 	// tx.auditLogger = opts.AuditLogger
 	tx.testHooks = nil
+	tx.cleanupCalled = false
+	tx.onError = nil
 
 	return tx
 }
@@ -451,7 +494,9 @@ func (t *Transaction) RegisterCommitWithRetryPolicy(fn func(ctx context.Context)
 	if t.state != StateInProgress {
 		return fmt.Errorf("cannot register commit action in transaction %d state %s", t.id, t.state)
 	}
-	t.commitActionsWithPolicy = append(t.commitActionsWithPolicy, ActionWithPolicy{fn: fn, rp: &rp})
+	// make a copy of the retry policy so the stored pointer remains valid
+	rpCopy := rp
+	t.commitActionsWithPolicy = append(t.commitActionsWithPolicy, ActionWithPolicy{fn: fn, rp: &rpCopy})
 	t.Log(logs.InfoLevel, "Transaction %d: Registered commit action with custom retry policy", t.id)
 	return nil
 }
@@ -465,7 +510,9 @@ func (t *Transaction) RegisterRollbackWithRetryPolicy(fn func(ctx context.Contex
 	if t.state != StateInProgress {
 		return fmt.Errorf("cannot register rollback action in transaction %d state %s", t.id, t.state)
 	}
-	t.rollbackActionsWithPolicy = append(t.rollbackActionsWithPolicy, ActionWithPolicy{fn: fn, rp: &rp})
+	// copy the policy before storing pointer
+	rpCopy := rp
+	t.rollbackActionsWithPolicy = append(t.rollbackActionsWithPolicy, ActionWithPolicy{fn: fn, rp: &rpCopy})
 	t.Log(logs.InfoLevel, "Transaction %d: Registered rollback action with custom retry policy", t.id)
 	return nil
 }
@@ -492,7 +539,6 @@ func (t *Transaction) Begin(ctx context.Context) error {
 	t.resources = make([]TransactionalResource, 0)
 	t.savepoints = make(map[string]int)
 	t.abortCalled = false
-
 	if t.lifecycleHooks != nil && t.lifecycleHooks.OnBegin != nil {
 		t.lifecycleHooks.OnBegin(t.id, ctx)
 	}
@@ -505,6 +551,11 @@ func (t *Transaction) Begin(ctx context.Context) error {
 		if err := t.distributedCoordinator.BeginDistributed(t); err != nil {
 			return fmt.Errorf("begin distributed failed: %w", err)
 		}
+	}
+
+	if t.storage != nil {
+		// ensure durable initial state
+		_ = t.storage.SaveTxState(t.id, storage.TxStateInProgress, map[string]any{"isolation": t.isolationLevel})
 	}
 
 	if t.tracer != nil {
@@ -619,13 +670,39 @@ func (t *Transaction) prepareResources(ctx context.Context) error {
 	for i, res := range t.resources {
 		if pr, ok := res.(PreparableResource); ok {
 			desc := fmt.Sprintf("resource prepare %d for transaction %d", i, t.id)
+			// append a prepare log entry and check idempotency
+			if t.storage != nil {
+				// check existing logs to see if this resource was prepared
+				entries, _ := t.storage.GetLog(t.id)
+				key := idKey(t.id, "prepare", i)
+				already := false
+				for _, le := range entries {
+					if le.Key == key && le.Applied {
+						already = true
+						break
+					}
+				}
+				if already {
+					t.Log(logs.InfoLevel, "Transaction %d: Resource %d already prepared (idempotent skip)", t.id, i)
+					continue
+				}
+				_ = t.storage.AppendLog(t.id, storage.LogEntry{Key: key, Type: "prepare", Applied: false, Data: map[string]interface{}{"index": i}})
+			}
+
 			if err := retryAction(prepareCtx, func(ctx context.Context) error {
 				return safeAction(ctx, pr.Prepare, desc)
 			}, desc, t.retryPolicy); err != nil {
 				t.Log(logs.ErrorLevel, "Transaction %d: Resource prepare failed: %v", t.id, err)
 				return fmt.Errorf("prepare resource error: %w", err)
 			}
+
+			if t.storage != nil {
+				_ = t.storage.AppendLog(t.id, storage.LogEntry{Key: idKey(t.id, "prepare", i), Type: "prepare", Applied: true, Data: map[string]interface{}{"index": i}})
+			}
 		}
+	}
+	if t.storage != nil {
+		_ = t.storage.SaveTxState(t.id, storage.TxStatePrepared, nil)
 	}
 	return nil
 }
@@ -712,6 +789,21 @@ func (t *Transaction) Commit(ctx context.Context) error {
 			go func(i int, action func(ctx context.Context) error) {
 				defer wg.Done()
 				desc := fmt.Sprintf("commit action %d in transaction %d", i, t.id)
+				// idempotency: skip if already applied
+				if t.storage != nil {
+					entries, _ := t.storage.GetLog(t.id)
+					key := idKey(t.id, "commit-action", i)
+					for _, le := range entries {
+						if le.Key == key && le.Applied {
+							// already applied
+							if t.lifecycleHooks != nil && t.lifecycleHooks.OnAfterCommitAction != nil {
+								t.lifecycleHooks.OnAfterCommitAction(t.id, desc, commitCtx)
+							}
+							return
+						}
+					}
+					_ = t.storage.AppendLog(t.id, storage.LogEntry{Key: key, Type: "commit-action", Applied: false, Data: map[string]interface{}{"index": i}})
+				}
 
 				if t.lifecycleHooks != nil && t.lifecycleHooks.OnBeforeCommitAction != nil {
 					t.lifecycleHooks.OnBeforeCommitAction(t.id, desc, commitCtx)
@@ -724,6 +816,9 @@ func (t *Transaction) Commit(ctx context.Context) error {
 					t.metrics.IncRetryCount()
 				} else {
 					t.metrics.RecordActionDuration("commit_action", time.Since(start))
+					if t.storage != nil {
+						_ = t.storage.AppendLog(t.id, storage.LogEntry{Key: idKey(t.id, "commit-action", i), Type: "commit-action", Applied: true, Data: map[string]interface{}{"index": i}})
+					}
 				}
 
 				if t.lifecycleHooks != nil && t.lifecycleHooks.OnAfterCommitAction != nil {
@@ -761,6 +856,23 @@ func (t *Transaction) Commit(ctx context.Context) error {
 	} else {
 		for i, action := range t.commitActions {
 			desc := fmt.Sprintf("commit action %d in transaction %d", i, t.id)
+			// idempotency: skip if already applied
+			if t.storage != nil {
+				entries, _ := t.storage.GetLog(t.id)
+				key := idKey(t.id, "commit-action", i)
+				skipped := false
+				for _, le := range entries {
+					if le.Key == key && le.Applied {
+						skipped = true
+						break
+					}
+				}
+				if skipped {
+					t.Log(logs.InfoLevel, "Transaction %d: Commit action %d already applied (idempotent skip)", t.id, i)
+					continue
+				}
+				_ = t.storage.AppendLog(t.id, storage.LogEntry{Key: key, Type: "commit-action", Applied: false, Data: map[string]interface{}{"index": i}})
+			}
 			if t.lifecycleHooks != nil && t.lifecycleHooks.OnBeforeCommitAction != nil {
 				t.lifecycleHooks.OnBeforeCommitAction(t.id, desc, commitCtx)
 			}
@@ -789,6 +901,9 @@ func (t *Transaction) Commit(ctx context.Context) error {
 				return TransactionError{TxID: t.id, Err: fmt.Errorf("commit action failed: %v", err), Code: "COMMIT_ERR", Category: "TRANSIENT", Action: "commit", StackTrace: stack}
 			} else {
 				t.metrics.RecordActionDuration("commit_action", time.Since(start))
+				if t.storage != nil {
+					_ = t.storage.AppendLog(t.id, storage.LogEntry{Key: idKey(t.id, "commit-action", i), Type: "commit-action", Applied: true, Data: map[string]interface{}{"index": i}})
+				}
 			}
 			if t.lifecycleHooks != nil && t.lifecycleHooks.OnAfterCommitAction != nil {
 				t.lifecycleHooks.OnAfterCommitAction(t.id, desc, commitCtx)
@@ -840,6 +955,20 @@ func (t *Transaction) Commit(ctx context.Context) error {
 			go func(i int, res TransactionalResource) {
 				defer wg.Done()
 				desc := fmt.Sprintf("resource commit %d for transaction %d", i, t.id)
+				// idempotency: skip if already applied
+				if t.storage != nil {
+					entries, _ := t.storage.GetLog(t.id)
+					key := idKey(t.id, "resource-commit", i)
+					for _, le := range entries {
+						if le.Key == key && le.Applied {
+							if t.lifecycleHooks != nil && t.lifecycleHooks.OnAfterCommitAction != nil {
+								t.lifecycleHooks.OnAfterCommitAction(t.id, desc, commitCtx)
+							}
+							return
+						}
+					}
+					_ = t.storage.AppendLog(t.id, storage.LogEntry{Key: key, Type: "resource-commit", Applied: false, Data: map[string]interface{}{"index": i}})
+				}
 				if t.lifecycleHooks != nil && t.lifecycleHooks.OnBeforeCommitAction != nil {
 					t.lifecycleHooks.OnBeforeCommitAction(t.id, desc, commitCtx)
 				}
@@ -851,6 +980,9 @@ func (t *Transaction) Commit(ctx context.Context) error {
 					t.metrics.IncRetryCount()
 				} else {
 					t.metrics.RecordActionDuration("resource_commit", time.Since(start))
+					if t.storage != nil {
+						_ = t.storage.AppendLog(t.id, storage.LogEntry{Key: idKey(t.id, "resource-commit", i), Type: "resource-commit", Applied: true, Data: map[string]interface{}{"index": i}})
+					}
 				}
 				if t.lifecycleHooks != nil && t.lifecycleHooks.OnAfterCommitAction != nil {
 					t.lifecycleHooks.OnAfterCommitAction(t.id, desc, commitCtx)
@@ -1012,8 +1144,10 @@ func (t *Transaction) Rollback(ctx context.Context) error {
 		return fmt.Errorf("rollback context error: %w", err)
 	}
 	actions := t.rollbackActions
+	actionWPs := t.rollbackActionsWithPolicy
 	resources := t.resources
 	t.rollbackActions = nil
+	t.rollbackActionsWithPolicy = nil
 	t.resources = nil
 	t.state = StateRolledBack
 	t.mu.Unlock()
@@ -1040,6 +1174,20 @@ func (t *Transaction) Rollback(ctx context.Context) error {
 			go func(i int, action func(ctx context.Context) error) {
 				defer wg.Done()
 				desc := fmt.Sprintf("rollback action %d in transaction %d", i, t.id)
+				// idempotency: skip if already applied
+				if t.storage != nil {
+					entries, _ := t.storage.GetLog(t.id)
+					key := idKey(t.id, "rollback-action", i)
+					for _, le := range entries {
+						if le.Key == key && le.Applied {
+							if t.lifecycleHooks != nil && t.lifecycleHooks.OnAfterRollbackAction != nil {
+								t.lifecycleHooks.OnAfterRollbackAction(t.id, desc, rbCtx)
+							}
+							return
+						}
+					}
+					_ = t.storage.AppendLog(t.id, storage.LogEntry{Key: key, Type: "rollback-action", Applied: false, Data: map[string]interface{}{"index": i}})
+				}
 				if t.lifecycleHooks != nil && t.lifecycleHooks.OnBeforeRollbackAction != nil {
 					t.lifecycleHooks.OnBeforeRollbackAction(t.id, desc, rbCtx)
 				}
@@ -1070,9 +1218,66 @@ func (t *Transaction) Rollback(ctx context.Context) error {
 			}, desc, t.retryPolicy); err != nil {
 				errs = append(errs, err)
 				t.Log(logs.ErrorLevel, "Transaction %d: Error during rollback action %d: %v", t.id, i, err)
+			} else {
+				if t.storage != nil {
+					_ = t.storage.AppendLog(t.id, storage.LogEntry{Key: idKey(t.id, "rollback-action", i), Type: "rollback-action", Applied: true, Data: map[string]interface{}{"index": i}})
+				}
 			}
 			if t.lifecycleHooks != nil && t.lifecycleHooks.OnAfterRollbackAction != nil {
 				t.lifecycleHooks.OnAfterRollbackAction(t.id, desc, rbCtx)
+			}
+		}
+	}
+
+	// Execute rollback actions registered with custom retry policies (LIFO)
+	if len(actionWPs) > 0 {
+		t.Log(logs.InfoLevel, "Transaction %d: Executing rollback actions with custom retry policies", t.id)
+		if t.parallelRollback {
+			var wg sync.WaitGroup
+			errCh := make(chan error, len(actionWPs))
+			for i := len(actionWPs) - 1; i >= 0; i-- {
+				wg.Add(1)
+				idx := i
+				wp := actionWPs[idx]
+				go func(i int, actionWP ActionWithPolicy) {
+					defer wg.Done()
+					desc := fmt.Sprintf("rollback action (custom policy) %d in transaction %d", i, t.id)
+					if t.lifecycleHooks != nil && t.lifecycleHooks.OnBeforeRollbackAction != nil {
+						t.lifecycleHooks.OnBeforeRollbackAction(t.id, desc, rbCtx)
+					}
+					if err := retryAction(rbCtx, func(ctx context.Context) error {
+						return safeAction(ctx, actionWP.fn, desc)
+					}, desc, *actionWP.rp); err != nil {
+						errCh <- err
+					} else {
+						t.metrics.RecordActionDuration("rollback_action_custom", time.Since(time.Now()))
+					}
+					if t.lifecycleHooks != nil && t.lifecycleHooks.OnAfterRollbackAction != nil {
+						t.lifecycleHooks.OnAfterRollbackAction(t.id, desc, rbCtx)
+					}
+				}(idx, wp)
+			}
+			wg.Wait()
+			close(errCh)
+			for err := range errCh {
+				t.Log(logs.ErrorLevel, "Transaction %d: Error during custom-policy rollback action: %v", t.id, err)
+				errs = append(errs, err)
+			}
+		} else {
+			for i := len(actionWPs) - 1; i >= 0; i-- {
+				desc := fmt.Sprintf("rollback action (custom policy) %d in transaction %d", i, t.id)
+				if t.lifecycleHooks != nil && t.lifecycleHooks.OnBeforeRollbackAction != nil {
+					t.lifecycleHooks.OnBeforeRollbackAction(t.id, desc, rbCtx)
+				}
+				if err := retryAction(rbCtx, func(ctx context.Context) error {
+					return safeAction(ctx, actionWPs[i].fn, desc)
+				}, desc, *actionWPs[i].rp); err != nil {
+					errs = append(errs, err)
+					t.Log(logs.ErrorLevel, "Transaction %d: Error during rollback custom action %d: %v", t.id, i, err)
+				}
+				if t.lifecycleHooks != nil && t.lifecycleHooks.OnAfterRollbackAction != nil {
+					t.lifecycleHooks.OnAfterRollbackAction(t.id, desc, rbCtx)
+				}
 			}
 		}
 	}
@@ -1085,6 +1290,20 @@ func (t *Transaction) Rollback(ctx context.Context) error {
 			go func(i int, res TransactionalResource) {
 				defer wg.Done()
 				desc := fmt.Sprintf("resource rollback %d for transaction %d", i, t.id)
+				// idempotency: skip if already applied
+				if t.storage != nil {
+					entries, _ := t.storage.GetLog(t.id)
+					key := idKey(t.id, "resource-rollback", i)
+					for _, le := range entries {
+						if le.Key == key && le.Applied {
+							if t.lifecycleHooks != nil && t.lifecycleHooks.OnAfterRollbackAction != nil {
+								t.lifecycleHooks.OnAfterRollbackAction(t.id, desc, rbCtx)
+							}
+							return
+						}
+					}
+					_ = t.storage.AppendLog(t.id, storage.LogEntry{Key: key, Type: "resource-rollback", Applied: false, Data: map[string]interface{}{"index": i}})
+				}
 				if t.lifecycleHooks != nil && t.lifecycleHooks.OnBeforeRollbackAction != nil {
 					t.lifecycleHooks.OnBeforeRollbackAction(t.id, desc, rbCtx)
 				}
@@ -1115,6 +1334,10 @@ func (t *Transaction) Rollback(ctx context.Context) error {
 			}, desc, t.retryPolicy); err != nil {
 				errs = append(errs, err)
 				t.Log(logs.ErrorLevel, "Transaction %d: Error during resource rollback %d: %v", t.id, i, err)
+			} else {
+				if t.storage != nil {
+					_ = t.storage.AppendLog(t.id, storage.LogEntry{Key: idKey(t.id, "resource-rollback", i), Type: "resource-rollback", Applied: true, Data: map[string]interface{}{"index": i}})
+				}
 			}
 			if t.lifecycleHooks != nil && t.lifecycleHooks.OnAfterRollbackAction != nil {
 				t.lifecycleHooks.OnAfterRollbackAction(t.id, desc, rbCtx)
